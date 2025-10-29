@@ -1,0 +1,38 @@
+# Core RL + simulation
+gymnasium==0.29.1
+panda-gym==3.0.7
+box2d-py==2.3.8
+stable-baselines3==2.3.2
+
+# PyTorch (CPU-only build)
+#torch==2.5.1+cpu
+#torchaudio==2.5.1+cpu
+#torchvision==0.20.1+cpu
+#-f https://download.pytorch.org/whl/cpu
+
+# pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+# Rendering and visualization (X server compatible)
+pyglet==1.5.27
+glfw==2.6.4
+PyOpenGL==3.1.7
+imageio==2.35.1
+opencv-python==4.10.0.84
+matplotlib==3.9.2
+
+# Utilities & dependencies
+scipy==1.14.1
+cloudpickle==3.0.0
+tqdm==4.66.5
+six==1.16.0
+pillow==10.4.0
+
+# Jupyter/IPython tools (optional for debugging)
+ipykernel==6.29.5
+ipython==8.26.0
+matplotlib-inline==0.1.7
+
+# Logging + config
+tensorboard==2.18.0
+pyyaml==6.0.2
+

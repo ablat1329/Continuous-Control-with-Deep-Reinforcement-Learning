@@ -30,7 +30,7 @@ for i in range(1000):
 
     if i % 100 == 0:
         record = True
-    
+
     while not done:
 
         act = agent.choose_action(obs)
@@ -42,10 +42,10 @@ for i in range(1000):
         if record:
             frame_set.append(env.render(mode='rgb_array'))
         obs = next_state
-    
+
     if record:
         imageio.mimsave(os.path.join(img_path, f'eps-{i}.gif'), frame_set, fps=30)
-        record = False   
+        record = False
     score_history.append(score)
 
     print("==============================")

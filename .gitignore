@@ -131,3 +131,13 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+/models/
+renders/
+RL_venv*/
+videos/
+logs/
+tensorboard_*/
+
+images/
