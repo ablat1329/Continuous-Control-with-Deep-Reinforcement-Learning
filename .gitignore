@@ -141,3 +141,5 @@ logs/
 tensorboard_*/
 
 images/
+videos/
+models_SAC_13/
