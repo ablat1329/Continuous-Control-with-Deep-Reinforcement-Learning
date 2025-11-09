@@ -2,10 +2,11 @@
 """
 SAC + HER training for PandaPickAndPlace with:
  - resume capability
- - two-phase training schedule (explore -> refine)
+ - three-phase training schedule
  - checkpointing & best-model saving
  - evaluation callback with GIF & CSV logging
  - debug_rollouts helper
+ - SSD-safe logging (no long-running open files)
 
 Updated for stable-baselines3 2.7.0+ (HerReplayBuffer instead of HER wrapper)
 """
@@ -13,7 +14,7 @@ Updated for stable-baselines3 2.7.0+ (HerReplayBuffer instead of HER wrapper)
 import os
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
+import signal
 import time
 import glob
 import json
@@ -63,9 +64,10 @@ class Config:
 
     # Logging / Checkpoints / Eval
     LOG_DIR = "./tensorboard_logs/"
-    MODEL_DIR = "models_continueTime"
+    MODEL_DIR = "models_continueTime2"
     SAVE_DIR = "renders"
-    CSV_LOG = os.path.join(MODEL_DIR, "eval_history.csv")
+    EVAL_LOGS_DIR = os.path.join(MODEL_DIR, "eval_logs")  # Directory for eval CSVs
+    CSV_LOG = os.path.join(MODEL_DIR, "eval_history.csv")  # Master summary CSV
     EVAL_FREQ = 25_000  # More frequent evaluation
     N_EVAL_EPISODES = 10  # More episodes for reliable metrics
     CHECKPOINT_FREQ = 100_000  # More frequent checkpoints
@@ -79,6 +81,7 @@ class Config:
 os.makedirs(Config.MODEL_DIR, exist_ok=True)
 os.makedirs(Config.SAVE_DIR, exist_ok=True)
 os.makedirs(Config.LOG_DIR, exist_ok=True)
+os.makedirs(Config.EVAL_LOGS_DIR, exist_ok=True)
 
 set_random_seed(Config.SEED)
 
@@ -88,6 +91,7 @@ set_random_seed(Config.SEED)
 def make_env(env_name, reward_type, render_mode="rgb_array", monitor_dir=None):
     """
     Create environment with proper Monitor wrapper for accurate logging
+    If monitor_dir=None, Monitor wrapper is used but without file logging
     """
     env = gym.make(env_name, reward_type=reward_type, render_mode=render_mode)
 
@@ -126,7 +130,7 @@ def load_phase_meta():
     return None
 
 # -------------------------
-# Eval callback with GIF, CSV logging, best model saving
+# SSD-Safe Eval callback with per-evaluation CSV files
 # -------------------------
 class EvalAndSaveCallback(BaseCallback):
     def __init__(self, eval_env, eval_freq=Config.EVAL_FREQ, n_eval_episodes=Config.N_EVAL_EPISODES,
@@ -139,7 +143,7 @@ class EvalAndSaveCallback(BaseCallback):
         self.best_mean_reward = -float("inf")
         self.last_eval_step = 0  # Track last evaluation to avoid duplicates
 
-        # init CSV if missing
+        # init master CSV if missing
         if not os.path.exists(Config.CSV_LOG):
             with open(Config.CSV_LOG, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -154,19 +158,24 @@ class EvalAndSaveCallback(BaseCallback):
 
             mean_reward, std_reward = evaluate_policy(self.model, self.eval_env, n_eval_episodes=self.n_eval_episodes, render=False)
 
-            # compute deterministic success rate
-            # FIXED: Track success throughout the episode, not just final step
+            # Compute deterministic success rate and collect detailed episode data
             success_count = 0
             episode_lengths = []
-            for _ in range(self.n_eval_episodes):
+            episode_rewards = []
+            episode_details = []
+
+            for ep_idx in range(self.n_eval_episodes):
                 obs, _ = self.eval_env.reset()
                 done = False
                 episode_success = False  # Track if success occurred at ANY point
                 steps = 0
+                ep_reward = 0
+
                 while not done:
                     action, _ = self.model.predict(obs, deterministic=True)
                     obs, reward, terminated, truncated, info = self.eval_env.step(action)
                     steps += 1
+                    ep_reward += reward
 
                     # Check success at EVERY step, not just the last one
                     if info.get("is_success", False):
@@ -175,33 +184,56 @@ class EvalAndSaveCallback(BaseCallback):
                     done = terminated or truncated
 
                 episode_lengths.append(steps)
+                episode_rewards.append(ep_reward)
+
                 if episode_success:
                     success_count += 1
+
+                # Store episode details for per-eval CSV
+                episode_details.append({
+                    'episode': ep_idx + 1,
+                    'steps': steps,
+                    'reward': ep_reward,
+                    'success': episode_success
+                })
+
             success_rate = success_count / self.n_eval_episodes
             mean_episode_length = np.mean(episode_lengths)
 
             # Print & log
             ts = self.num_timesteps
+            timestamp = time.time()
+            eval_timestamp_str = time.strftime("%Y%m%d_%H%M%S", time.localtime(timestamp))
+
             print(f"\n[EVAL] Step {ts:,}: mean_reward={mean_reward:.3f} ± {std_reward:.3f}, success_rate={success_rate*100:.1f}%, ep_len={mean_episode_length:.1f}")
+
             self.logger.record("eval/mean_reward", mean_reward)
             self.logger.record("eval/std_reward", std_reward)
             self.logger.record("eval/success_rate", success_rate)
             self.logger.record("eval/mean_episode_length", mean_episode_length)
             self.logger.dump(ts)
 
-            # write CSV
+            # Write to master summary CSV (open and close immediately)
             with open(Config.CSV_LOG, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([ts, float(mean_reward), float(std_reward), float(success_rate), float(mean_episode_length), time.time()])
+                writer.writerow([ts, float(mean_reward), float(std_reward), float(success_rate), float(mean_episode_length), timestamp])
 
-            # save best model
+            # Write detailed per-evaluation CSV (SSD-safe: opens and closes immediately)
+            eval_csv_path = os.path.join(Config.EVAL_LOGS_DIR, f"eval_{ts:08d}_{eval_timestamp_str}.csv")
+            with open(eval_csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=['episode', 'steps', 'reward', 'success'])
+                writer.writeheader()
+                writer.writerows(episode_details)
+            print(f"[INFO] Detailed eval log saved: {eval_csv_path}")
+
+            # Save best model based on mean_reward (original approach)
             if mean_reward > self.best_mean_reward:
                 self.best_mean_reward = mean_reward
                 best_path = os.path.join(Config.MODEL_DIR, "best_model")
                 self.model.save(best_path)
                 print(f"[INFO] New best model saved: {best_path} (reward: {mean_reward:.3f})")
 
-            # create gif of deterministic rollout
+            # Create gif of deterministic rollout
             self._create_gif()
 
         return True
@@ -214,7 +246,6 @@ class EvalAndSaveCallback(BaseCallback):
             'steps': 0,
             'success': False,
             'final_distance': None,
-            'grasped': False
         }
 
         for i in range(400):
@@ -227,14 +258,14 @@ class EvalAndSaveCallback(BaseCallback):
             # Track important events
             episode_info['steps'] = i + 1
 
-            # FIXED: Check success at EVERY step, not just the end
+            # Check success at EVERY step, not just the end
             if info.get("is_success", False):
                 episode_info['success'] = True
 
             # Try to detect grasping (environment-dependent)
-            if 'achieved_goal' in info and 'desired_goal' in info:
-                achieved = np.array(info['achieved_goal'])
-                desired = np.array(info['desired_goal'])
+            if 'achieved_goal' in obs and 'desired_goal' in obs:
+                achieved = np.array(obs['achieved_goal'])
+                desired = np.array(obs['desired_goal'])
                 episode_info['final_distance'] = float(np.linalg.norm(achieved - desired))
 
             if terminated or truncated:
@@ -254,8 +285,7 @@ class EvalAndSaveCallback(BaseCallback):
                 f"eval_{self.num_timesteps:07d}_{status}{dist_str}.gif"
             )
 
-            # Save at 15 fps for better viewability (was 20 fps)
-            # Duration parameter adds delay between frames for slower playback
+            # Save at 15 fps for better viewability
             imageio.mimsave(gif_path, frames, fps=15, loop=0)
 
             print(f"[INFO] GIF saved: {gif_path}")
@@ -266,7 +296,7 @@ class EvalAndSaveCallback(BaseCallback):
 # -------------------------
 # High-quality visualization helper
 # -------------------------
-def create_detailed_visualization(model, env, n_episodes=5, save_dir="detailed_renders"):
+def create_detailed_visualization(model, env, n_episodes=5, save_dir="detailed_renders", deterministic=True):
     """
     Create high-quality videos with overlay information showing:
     - Current step
@@ -287,22 +317,24 @@ def create_detailed_visualization(model, env, n_episodes=5, save_dir="detailed_r
         step = 0
         success = False
 
-        print(f"\n--- Recording Episode {ep+1} ---")
+        mode = "DETERMINISTIC" if deterministic else "STOCHASTIC"
+        print(f"\n--- Recording Episode {ep+1} ({mode}) ---")
 
         while step < 400:
-            action, _ = model.predict(obs, deterministic=True)
+            action, _ = model.predict(obs, deterministic=deterministic)
             obs, reward, terminated, truncated, info = env.step(action)
 
-            # Capture every single frame from unwrapped env
-            frame = render_env.render()
+            # Capture every single frame
+            frame = env.render()
             frames.append(frame)
 
             # Print progress every 10 steps
-            if step % 10 == 0 and 'achieved_goal' in info and 'desired_goal' in info:
-                achieved = np.array(info['achieved_goal'])
-                desired = np.array(info['desired_goal'])
-                dist = np.linalg.norm(achieved - desired)
-                print(f"  Step {step:3d}: distance={dist:.4f}, reward={reward:.2f}")
+            if step % 10 == 0:
+                if 'achieved_goal' in obs and 'desired_goal' in obs:
+                    achieved = np.array(obs['achieved_goal'])
+                    desired = np.array(obs['desired_goal'])
+                    dist = np.linalg.norm(achieved - desired)
+                    print(f"  Step {step:3d}: distance={dist:.4f}, reward={reward:.2f}")
 
             step += 1
 
@@ -323,12 +355,18 @@ def create_detailed_visualization(model, env, n_episodes=5, save_dir="detailed_r
 
             # Save at 12 fps for better viewability and smoothness balance
             imageio.mimsave(gif_path, frames, fps=12, loop=0)
-            print(f"  Saved: {gif_path} ({len(frames[:-24])} frames @ 12fps, includes 2s pause)")
+            print(f"  Saved: {gif_path} ({len(frames)-24} frames @ 12fps, includes 2s pause)")
 
 # -------------------------
 # Debug helper: prints info & saves GIFs
 # -------------------------
-def debug_rollouts(model, env, n_episodes=3, save_dir="debug_renders"):
+def debug_rollouts(model, env, n_episodes=3, save_dir="debug_renders", deterministic=True):
+    """
+    Run debug episodes with detailed logging
+
+    Args:
+        deterministic: If True, shows best learned behavior. If False, shows exploration behavior.
+    """
     os.makedirs(save_dir, exist_ok=True)
     successful_eps = []
     failed_eps = []
@@ -336,39 +374,35 @@ def debug_rollouts(model, env, n_episodes=3, save_dir="debug_renders"):
     # Unwrap Monitor if present for rendering
     render_env = env.unwrapped if isinstance(env, Monitor) else env
 
+    mode = "DETERMINISTIC" if deterministic else "STOCHASTIC"
+    print(f"\n=== Debug Mode: {mode} ===")
+
     for ep in range(n_episodes):
         obs, _ = env.reset()
         frames = []
         step = 0
         episode_reward = 0
-        print(f"\n--- Debug Episode {ep+1} ---")
+        print(f"\n--- Debug Episode {ep+1} ({mode}) ---")
 
         while True:
-            action, _ = model.predict(obs, deterministic=False)
-            # action stats
-            arr = np.array(action)
-            try:
-                amin, amax, amean = float(arr.min()), float(arr.max()), float(arr.mean())
-            except Exception:
-                amin = amax = amean = float(arr)
+            action, _ = model.predict(obs, deterministic=deterministic)
 
+            # Action stats
+            arr = np.array(action)
 
             obs, reward, terminated, truncated, info = env.step(action)
             episode_reward += reward
 
-            # Capture more frames
-            frames.append(render_env.render())
-            # if info :
-            #     print("First info with goals:", list(info.keys()))
+            # Capture frames
+            frames.append(env.render())
 
-            # Print key info every step, including distance from obs dict (gym version >3.0)
-            achieved = obs.get("achieved_goal", "N/A")
-            desired = obs.get("desired_goal", "N/A")
-            if isinstance(achieved, np.ndarray) and isinstance(desired, np.ndarray):
+            # Print key info with action details
+            if 'achieved_goal' in obs and 'desired_goal' in obs:
+                achieved = np.array(obs['achieved_goal'])
+                desired = np.array(obs['desired_goal'])
                 dist = np.linalg.norm(achieved - desired)
-                # Format each element to width 5, 2 decimals, and join them
                 formatted_action = ' '.join(f"{x:5.2f}" for x in arr)
-                print(f"  step {step}: distance to goal = {dist:.4f}, reward = {reward:.2f}, action = [{formatted_action}]")
+                print(f"  step {step}: dist={dist:.4f}, reward={reward:.2f}, action=[{formatted_action}]")
 
             step += 1
             if terminated or truncated or step > 500:
@@ -381,9 +415,10 @@ def debug_rollouts(model, env, n_episodes=3, save_dir="debug_renders"):
                     for _ in range(12):
                         frames.append(pause_frame)
 
-                    gif_path = os.path.join(save_dir, f"debug_ep_{ep+1}_{'success' if success else 'fail'}.gif")
+                    mode_suffix = "det" if deterministic else "stoch"
+                    gif_path = os.path.join(save_dir, f"debug_ep{ep+1}_{mode_suffix}_{'success' if success else 'fail'}.gif")
                     # Slower playback at 12 fps with pause
-                    imageio.mimsave(gif_path, frames, fps=5, loop=0)
+                    imageio.mimsave(gif_path, frames, fps=12, loop=0)
                     print(f"Saved debug GIF: {gif_path}")
 
                 if success:
@@ -392,7 +427,7 @@ def debug_rollouts(model, env, n_episodes=3, save_dir="debug_renders"):
                     failed_eps.append(ep+1)
                 break
 
-    print(f"\n=== Debug Summary ===")
+    print(f"\n=== Debug Summary ({mode}) ===")
     print(f"Successful episodes: {successful_eps} ({len(successful_eps)}/{n_episodes})")
     print(f"Failed episodes: {failed_eps} ({len(failed_eps)}/{n_episodes})")
 
@@ -424,29 +459,26 @@ def build_sac_with_her(env, n_sampled_goal, ent_coef, learning_rate):
         replay_buffer_kwargs=dict(
             n_sampled_goal=n_sampled_goal,
             goal_selection_strategy="future",
-            # online_sampling=True,
-            # max_episode_length=50,  # Match typical episode length
         ),
-        tensorboard_log=Config.LOG_DIR, # os.path.join(Config.LOG_DIR, f"SAC_HER_{time.strftime('%Y%m%d_%H%M%S')}"),
+        tensorboard_log=Config.LOG_DIR,
         device=Config.DEVICE,
         verbose=1,
     )
     return model
 
 # -------------------------
-# Two-phase training with resume support
+# Three-phase training with resume support
 # -------------------------
-def train_resume_two_phase():
-    # Create environments with Monitor wrapper
-    monitor_dir = os.path.join(Config.LOG_DIR, "monitor")
+def train_resume_three_phase():
+    # Create environments with Monitor wrapper (set monitor_dir=None to avoid file logging)
     env = make_env(Config.ENV_NAME, Config.REWARD_TYPE, render_mode="rgb_array", monitor_dir=None)
-    eval_env = make_env(Config.ENV_NAME, Config.REWARD_TYPE, render_mode="rgb_array", monitor_dir=monitor_dir)
+    eval_env = make_env(Config.ENV_NAME, Config.REWARD_TYPE, render_mode="rgb_array", monitor_dir=None)
 
     # Create callbacks once and reuse across phases
     eval_cb = EvalAndSaveCallback(eval_env, eval_freq=Config.EVAL_FREQ, n_eval_episodes=Config.N_EVAL_EPISODES)
     checkpoint_cb = CheckpointCallback(save_freq=Config.CHECKPOINT_FREQ, save_path=Config.MODEL_DIR, name_prefix="sac_her_checkpoint")
 
-    # load meta if exists (to resume phases)
+    # Load meta if exists (to resume phases)
     meta = load_phase_meta()
     start_phase = 0
     phase_remaining_timesteps = None
@@ -455,23 +487,62 @@ def train_resume_two_phase():
         phase_remaining_timesteps = meta.get("remaining_timesteps", None)
         print(f"[INFO] Found train_meta.json: resuming from phase {start_phase} with remaining timesteps {phase_remaining_timesteps}")
 
-    # check for latest best model to resume weights
-    latest_best = os.path.join(Config.MODEL_DIR, "best_model.zip")
-    latest_other = find_latest_checkpoint()
-    base_model_path = latest_best if os.path.exists(latest_best) else latest_other
-    if base_model_path:
-        print(f"[INFO] Found existing checkpoint to resume from: {base_model_path}")
+    # Check for latest checkpoint to resume weights
+    # Priority: latest checkpoint > best_model (for training resume, we want most recent progress)
+    latest_checkpoint = find_latest_checkpoint()
+    best_model_path = os.path.join(Config.MODEL_DIR, "best_model.zip")
 
-    # training loop over phases
+    if latest_checkpoint:
+        base_model_path = latest_checkpoint
+        print(f"[INFO] Found latest checkpoint to resume from: {base_model_path}")
+    elif os.path.exists(best_model_path):
+        base_model_path = best_model_path
+        print(f"[INFO] No checkpoints found, using best model: {base_model_path}")
+    else:
+        base_model_path = None
+        print(f"[INFO] No existing models found, starting fresh")
+
+
+    # -----------------------------
+    # Helper: Graceful Ctrl+C exit
+    # -----------------------------
+    def graceful_exit(sig, frame):
+        print("\n[INFO] Ctrl+C detected — saving model and replay buffer...")
+        try:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            save_base = os.path.join(Config.MODEL_DIR, f"interrupted_phase_{idx}_{timestamp}")
+
+            model.save(save_base)
+            print(f"[INFO] Model saved to: {save_base}")
+
+            # Save replay buffer too
+            buffer_path = save_base + "_replay.pkl"
+            model.save_replay_buffer(buffer_path)
+            print(f"[INFO] Replay buffer saved to: {buffer_path}")
+
+            save_phase_meta(idx, phase_timesteps)
+            print("[INFO] Phase metadata saved successfully.")
+        except Exception as e:
+            print(f"[WARN] Could not save model or replay buffer: {e}")
+        finally:
+            sys.exit(0)
+
+    # Register the handler
+    signal.signal(signal.SIGINT, graceful_exit)
+
+    # Register the handler for SIGTERM (system kill)
+    signal.signal(signal.SIGTERM, graceful_exit)
+
+    # Training loop over phases
     total_done = 0
     model = None
     for idx, phase in enumerate(Config.PHASES):
         if idx < start_phase:
-            # already completed earlier phase
+            # Already completed earlier phase
             total_done += phase["timesteps"]
             continue
 
-        # determine timesteps for this run (respect resume metadata)
+        # Determine timesteps for this run (respect resume metadata)
         if idx == start_phase and phase_remaining_timesteps:
             phase_timesteps = int(phase_remaining_timesteps)
             print(f"[INFO] Resuming phase {idx} for remaining {phase_timesteps} timesteps")
@@ -485,7 +556,7 @@ def train_resume_two_phase():
             # First phase - build new model
             model = build_sac_with_her(env, n_sampled_goal=phase["n_sampled_goal"],
                                        ent_coef=phase["ent_coef"], learning_rate=phase["learning_rate"])
-            # if checkpoint exists, load weights
+            # If checkpoint exists, load weights
             if base_model_path:
                 try:
                     print(f"[INFO] Loading weights from {base_model_path}...")
@@ -506,11 +577,18 @@ def train_resume_two_phase():
             # Subsequent phase - modify hyperparameters without creating new model
             print(f"[INFO] Updating hyperparameters for Phase {idx}")
 
-            # Update learning rate
-            model.learning_rate = phase["learning_rate"]
+            # Update learning rate, Replace the learning rate schedule and optimizer
+            # the optimizer still uses whatever lr_schedule was originally defined (from phase 0), unless you rebuild that schedule.
+
+            # model.learning_rate = phase["learning_rate"]
+            new_lr = phase["learning_rate"]
+            model.learning_rate = new_lr
+            model.lr_schedule = lambda _: new_lr # # override schedule with constant function
+
             if hasattr(model.policy, 'optimizer'):
                 for param_group in model.policy.optimizer.param_groups:
                     param_group['lr'] = phase["learning_rate"]
+            print(f"[INFO] Updated learning rate to {phase['learning_rate']}")
 
             # Update entropy coefficient
             if phase["ent_coef"] == "auto":
@@ -539,13 +617,13 @@ def train_resume_two_phase():
                 log_interval=Config.LOG_INTERVAL
             )
         except KeyboardInterrupt:
-            # save model and remaining timesteps
+            # Save model and remaining timesteps
             print("\n[INFO] KeyboardInterrupt detected - saving model and exiting gracefully.")
             model.save(os.path.join(Config.MODEL_DIR, f"interrupted_phase_{idx}_{int(time.time())}"))
             save_phase_meta(idx, phase_timesteps)
             raise
 
-        # phase completed -> mark next phase
+        # Phase completed -> mark next phase
         save_phase_meta(idx + 1, None)
         total_done += phase_timesteps
 
@@ -561,7 +639,7 @@ def train_resume_two_phase():
 # Entrypoint
 # -------------------------
 if __name__ == "__main__":
-    print("=== SAC+HER PandaPickAndPlace (two-phase, resume-capable) ===")
+    print("=== SAC+HER PandaPickAndPlace (three-phase, resume-capable, SSD-safe) ===")
     print(f"Using stable-baselines3 2.7.0+ with HerReplayBuffer")
     print(f"Device = {Config.DEVICE}, Logs -> {Config.LOG_DIR}")
 
@@ -620,14 +698,14 @@ if __name__ == "__main__":
         model = SAC.load(latest_model_path, env=eval_env, device=Config.DEVICE)
 
         # Create detailed visualizations
-        print("\nCreating high-quality visualizations...")
-        create_detailed_visualization(model, eval_env, n_episodes=5, save_dir="best_model_videos")
+        print("\nCreating high-quality visualizations (deterministic)...")
+        create_detailed_visualization(model, eval_env, n_episodes=5, save_dir="best_model_videos", deterministic=True)
 
         # Run evaluation
         print("\nRunning evaluation...")
         mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=20, render=False)
 
-        # Calculate success rate - FIXED: Track success throughout episode
+        # Calculate success rate - Track success throughout episode
         success_count = 0
         episode_lengths = []
         for i in range(20):
@@ -656,27 +734,27 @@ if __name__ == "__main__":
 
         print(f"\nEvaluation complete! Check 'best_model_videos/' for detailed GIFs.")
 
-        # optional debug rollouts
-        print("\nRunning debug rollouts (3 episodes) to inspect failures and produce gifs...")
-        debug_rollouts(model, eval_env, n_episodes=3, save_dir="debug_renders")
+        # Optional debug rollouts
+        print("\nRunning debug rollouts (3 episodes) to inspect behavior and produce gifs...")
+        debug_rollouts(model, eval_env, n_episodes=3, save_dir="debug_renders", deterministic=True)
 
         eval_env.close()
         sys.exit(0)
 
     # Normal training mode
-    model, train_env, eval_env = train_resume_two_phase()
+    model, train_env, eval_env = train_resume_three_phase()
 
-    # optional debug rollouts
+    # Optional debug rollouts
     print("\nRunning debug rollouts (3 episodes) to inspect failures and produce gifs...")
-    debug_rollouts(model, eval_env, n_episodes=3, save_dir="debug_renders")
+    debug_rollouts(model, eval_env, n_episodes=3, save_dir="debug_renders", deterministic=True)
 
-    # final evaluation
+    # Final evaluation
     mean_reward, success_rate = None, None
     try:
         # evaluate_policy returns mean & std; we compute deterministic success separately
         mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=20, render=False)
 
-        # Calculate success rate - FIXED: Track success throughout episode
+        # Calculate success rate - Track success throughout episode
         success_count = 0
         episode_lengths = []
         for _ in range(20):
@@ -705,7 +783,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[WARN] final evaluation failed: {e}")
 
-    # cleanup
+    # Cleanup
     train_env.close()
     eval_env.close()
     print("Done.")
